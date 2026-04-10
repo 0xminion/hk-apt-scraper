@@ -395,7 +395,7 @@ def format_report(new_listings, all_filtered, stats):
         direction = f" {l['direction']}" if l.get('direction') else ''
         age_str = f" | 🏗{l['building_age']}yr" if l.get('building_age') else ''
         source = l.get('source', 'squarefoot')
-        src_tag = '🟠' if source == 'midland' else '🔵'
+        src_tag = {'midland': '🟠', 'centanet': '🟢'}.get(source, '🔵')
         cat = '⭐' if l.get('area_category') == 'preferred' else '📌'
         score = l.get('score', 0)
         building = l.get('building') or 'Unknown'
@@ -421,6 +421,39 @@ def format_report(new_listings, all_filtered, stats):
         lines.append(f"  {name}: https://www.squarefoot.com.hk{path}")
 
     return '\n'.join(lines)
+
+
+def scrape_centanet():
+    """Run the Node.js Centanet scraper and return listings."""
+    import subprocess
+    script_path = os.path.expanduser('~/.hermes/scripts/centanet_scraper.js')
+    results_path = os.path.expanduser('~/.hermes/scripts/centanet_results.json')
+
+    try:
+        result = subprocess.run(
+            ['node', script_path],
+            capture_output=True, text=True, timeout=300,
+            cwd=os.path.expanduser('~/.hermes/scripts')
+        )
+        if result.stdout:
+            for line in result.stdout.strip().split('\n'):
+                if 'Total' in line or 'Scraping' in line:
+                    print(f"  {line}")
+        if result.returncode != 0:
+            print(f"  Centanet error (rc={result.returncode}): {result.stderr[:300]}")
+            return []
+    except subprocess.TimeoutExpired:
+        print("  Centanet scraper timed out")
+        return []
+    except Exception as e:
+        print(f"  Centanet scraper error: {e}")
+        return []
+
+    if os.path.exists(results_path):
+        with open(results_path) as f:
+            listings = json.load(f)
+        return listings
+    return []
 
 
 def scrape_midland():
@@ -486,11 +519,42 @@ def main():
         d = l.get('district', 'Unknown')
         district_counts[d] = district_counts.get(d, 0) + 1
 
+    # --- Scrape Centanet ---
+    print("\n=== Centanet.com (中原地產) ===")
+    centanet_listings = scrape_centanet()
+    print(f"  Total Centanet: {len(centanet_listings)} listings")
+    all_listings.extend(centanet_listings)
+
+    for l in centanet_listings:
+        d = l.get('district', 'Unknown')
+        district_counts[d] = district_counts.get(d, 0) + 1
+
     print(f"\nTotal scraped: {len(all_listings)}. Enriching building ages...")
     all_listings = enrich_building_ages(scraper, all_listings, age_cache)
 
     # Filter
     filtered = filter_listings(all_listings)
+
+    # Cross-source deduplication within this run
+    source_priority = {'squarefoot': 0, 'midland': 1, 'centanet': 2}
+    deduped = {}
+    dupes_removed = 0
+    for l in filtered:
+        lid = listing_id(l)
+        if lid in deduped:
+            existing = deduped[lid]
+            # Keep the listing with more complete data, break ties by source priority
+            existing_fields = sum(1 for v in existing.values() if v is not None and v != '')
+            new_fields = sum(1 for v in l.values() if v is not None and v != '')
+            existing_pri = source_priority.get(existing.get('source', ''), 99)
+            new_pri = source_priority.get(l.get('source', ''), 99)
+            if new_fields > existing_fields or (new_fields == existing_fields and new_pri < existing_pri):
+                deduped[lid] = l
+            dupes_removed += 1
+        else:
+            deduped[lid] = l
+    filtered = sorted(deduped.values(), key=lambda x: x.get('score', 0), reverse=True)
+    print(f"Dedup: {dupes_removed} cross-source duplicates removed ({len(filtered)} unique)")
 
     # Deduplicate against seen
     new_listings = []
