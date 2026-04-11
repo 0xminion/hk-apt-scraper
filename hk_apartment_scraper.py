@@ -42,14 +42,13 @@ MIDLAND_DISTRICTS = {
 # but we scrape it separately for any listing differences
 
 MIN_AREA = 500
-PREFER_MIN_AREA = 500
 MAX_AREA = 850
 MIN_PRICE = 25000
 MAX_PRICE = 55000
 MAX_BUILDING_AGE = 25  # years
 MAX_LISTING_AGE_DAYS = 7  # only show listings posted/updated within 7 days
 MAX_PAGES_PER_DISTRICT = 5
-EXCLUDED_KEYWORDS = ['mid-levels', 'mid levels', 'midlevels']
+EXCLUDED_KEYWORDS = ['mid-levels', 'mid levels', 'midlevels', 'the mid-levels', 'mid_levels']
 
 SEEN_FILE = os.path.expanduser('~/.hermes/scripts/hk_seen_ids.json')
 STATE_FILE = os.path.expanduser('~/.hermes/scripts/hk_scraper_state.json')
@@ -193,26 +192,34 @@ def fetch_building_age(scraper, detail_url):
 
 
 def scrape_district(scraper, district_name, path):
-    """Scrape all pages of a district."""
+    """Scrape all pages of a district with retry for rate-limited responses."""
     all_listings = []
     for page in range(1, MAX_PAGES_PER_DISTRICT + 1):
         url = f"https://www.squarefoot.com.hk{path}" if page == 1 else f"https://www.squarefoot.com.hk{path}/page-{page}"
-        try:
-            resp = scraper.get(url, timeout=20)
-            if resp.status_code != 200:
-                break
-            soup = BeautifulSoup(resp.text, 'lxml')
-            items = soup.find_all('div', class_=lambda c: bool(c) and 'property_item' in str(c))
-            if not items:
-                break
-            for item in items:
-                listing = parse_listing_item(item, district_name)
-                if listing and listing.get('price') and listing.get('area_sqft'):
-                    all_listings.append(listing)
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"  Error on page {page}: {e}")
-            break
+        items = []
+        for attempt in range(3):
+            try:
+                resp = scraper.get(url, timeout=20)
+                if resp.status_code != 200:
+                    break
+                soup = BeautifulSoup(resp.text, 'lxml')
+                items = soup.find_all('div', class_='property_item')
+                if not items:
+                    # Fallback: class names may have trailing spaces or extra classes
+                    items = soup.find_all('div', class_=lambda c: bool(c) and 'property_item' in str(c))
+                if items:
+                    break  # Got data, stop retrying
+                time.sleep(1.5)  # Brief wait before retry
+            except Exception as e:
+                print(f"  Error on page {page} attempt {attempt+1}: {e}")
+                time.sleep(1)
+        if not items:
+            continue
+        for item in items:
+            listing = parse_listing_item(item, district_name)
+            if listing and listing.get('price') and listing.get('area_sqft'):
+                all_listings.append(listing)
+        time.sleep(0.5)
     return all_listings
 
 
@@ -271,11 +278,13 @@ def filter_listings(listings):
         if age is not None and age > MAX_BUILDING_AGE:
             continue
 
-        # Exclude Mid-Levels locations
+        # Exclude Mid-Levels locations (check all text fields + URL)
         searchable = ' '.join([
             (l.get('building') or '').lower(),
             (l.get('address') or '').lower(),
             (l.get('district') or '').lower(),
+            (l.get('description') or '').lower(),
+            (l.get('url') or '').lower(),
         ])
         if any(kw in searchable for kw in EXCLUDED_KEYWORDS):
             continue
@@ -309,11 +318,11 @@ def filter_listings(listings):
 
         score = 0
 
-        # Area preference
-        if PREFER_MIN_AREA <= area <= MAX_AREA:
+        # Area bonus (larger within range = better)
+        if area >= 700:
             score += 30
-        elif area >= MIN_AREA:
-            score += 10
+        elif area >= 500:
+            score += 15
 
         # Value for money
         if l.get('price_per_sqft'):
@@ -363,7 +372,7 @@ def filter_listings(listings):
             score += 15
 
         l['score'] = score
-        l['area_category'] = 'preferred' if area >= PREFER_MIN_AREA else 'acceptable'
+        l['area_category'] = 'match'
         filtered.append(l)
 
     filtered.sort(key=lambda x: x.get('score', 0), reverse=True)
@@ -375,7 +384,7 @@ def format_report(new_listings, all_filtered, stats):
     lines = []
     lines.append(f"🏠 HK Apartment Daily Report — {now}")
     lines.append(f"Scraped {stats['total_scraped']} listings from {stats['districts']} districts")
-    lines.append(f"Budget: HKD$25k-55k/mo | Size: 400-800 sqft (prefer 500+) | Age: <25yr | Fresh: <7 days")
+    lines.append(f"Budget: HKD$25k-55k/mo | Size: 500-850 sqft | Age: <25yr | Fresh: <7 days")
     lines.append(f"Filtered: {stats['filtered']} match all criteria ({stats['new']} new today)")
     lines.append("")
 
@@ -396,7 +405,7 @@ def format_report(new_listings, all_filtered, stats):
         age_str = f" | 🏗{l['building_age']}yr" if l.get('building_age') else ''
         source = l.get('source', 'squarefoot')
         src_tag = {'midland': '🟠', 'centanet': '🟢'}.get(source, '🔵')
-        cat = '⭐' if l.get('area_category') == 'preferred' else '📌'
+        cat = '📌'
         score = l.get('score', 0)
         building = l.get('building') or 'Unknown'
 
@@ -412,9 +421,7 @@ def format_report(new_listings, all_filtered, stats):
         lines.append("")
 
     lines.append("— Summary —")
-    lines.append(f"Total matching: {len(all_filtered)}")
-    lines.append(f"Preferred (500-800 sqft): {sum(1 for l in all_filtered if l.get('area_category') == 'preferred')}")
-    lines.append(f"Acceptable (400-500 sqft): {sum(1 for l in all_filtered if l.get('area_category') == 'acceptable')}")
+    lines.append(f"Total matching: {len(all_filtered)} (500-850 sqft)")
     lines.append("")
     lines.append("🔍 Browse manually:")
     for name, path in TARGET_DISTRICTS.items():

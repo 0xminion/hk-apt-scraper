@@ -35,7 +35,7 @@ URL pattern: `https://hk.centanet.com/findproperty/list/rent/{neighborhood}?adso
 - Building age directly in `buildingAge` field (no detail page needed!)
 - Net area in `areaInfo.nSize`, rent in `priceInfo.rent`
 
-Filters: 500-850 sqft, HKD$25k-55k/mo, building age <25yr, listing freshness <7 days, scores by floor height, direction, value-for-money, building newness, bedrooms, recency.
+Filters: 500-850 sqft, HKD$25k-55k/mo, building age <25yr, listing freshness <7 days, excludes Mid-Levels (checked against building name, address, district, description, and detail URL). Scores by floor height, direction, value-for-money, building newness, bedrooms, recency.
 
 ## Deduplication pipeline
 Three-stage dedup before results are delivered:
@@ -65,21 +65,24 @@ python3 ~/.hermes/scripts/hk_apartment_scraper.py
 ## Key technical details
 - Uses `cloudscraper` to bypass Cloudflare (squarefoot.com.hk has CF protection)
 - BeautifulSoup with lxml parser
-- **Critical**: squarefoot has trailing spaces in CSS class names. Use lambda selector:
+- **Squarefoot CSS selector**: `find_all('div', class_='property_item')` works directly (confirmed Apr 2026). If it returns 0, a lambda fallback is also tried:
   ```python
   soup.find_all('div', class_=lambda c: bool(c) and 'property_item' in str(c))
   ```
-  NOT `class_='property_item'` (won't match due to trailing space)
+- **Retry logic**: Each page retries up to 3 times with 1.5s delays if no items found (handles intermittent rate-limiting)
 - HTML structure: `div.property_item` > `div.content.sqfoot_property_card` contains all data
 - Building name in `div.header.cat`, address in `div.meta`, price in `span.priceDesc`
 - Pagination: `/page-{N}` suffix
+
+## Mid-Levels exclusion
+Listings are filtered out if any of these fields contain mid-levels variants: building name, address, district, description, or detail URL. Keywords matched: `mid-levels`, `mid levels`, `midlevels`, `the mid-levels`, `mid_levels`.
 
 ## Building age enrichment
 Building age is NOT on listing cards — only on detail pages. Approach:
 1. Maintain cache in `hk_building_ages.json` (building_name → age)
 2. For each listing, check cache first
 3. For unknown buildings, fetch ONE detail page per building to get age
-4. Parse with: `re.search(r'Building age:\\s*(\\d+)\\s*Year', page_text)`
+4. Parse with: `re.search(r'Building age:\s*(\d+)\s*Year', page_text)`
 5. Filter out buildings older than MAX_BUILDING_AGE
 - First run fetches ~200 detail pages (slow). Subsequent runs only check new buildings (fast).
 - Centanet has building age directly in listing data (no enrichment needed)
@@ -89,7 +92,7 @@ Building age is NOT on listing cards — only on detail pages. Approach:
 |---|---|---|
 | **centanet.com** | ✅ Scrapable | Nuxt SSR with `__NUXT__` data. Node.js evaluates JS to extract structured JSON. Building age included in listing data. ~62 unique HK Island listings after dedup. |
 | **28hse.com** | ✅ Scrapable | Same parent company as squarefoot (28Hse Ltd). Same URL structure (`/en/rent/a1/dg4`), same lambda class fix needed. ~80-90% listing overlap with squarefoot — marginal value-add. |
-| **midland.com.hk** | ❌ React SPA | Fully client-rendered. No listings in raw HTML. Would need `playwright` + correct district codes. District code format: `Hong-Kong-Island-{District}-D-{code}`. Building age shown on cards if you can render. |
+| **midland.com.hk** | ✅ Via API | `midland_scraper.js` uses Playwright to get Bearer token, then queries `data.midland.com.hk/search/v2/properties` directly. ~178 HK Island listings. Fast and reliable. |
 | **centaline.com.hk** | ❌ Timeout | Connection timeout from this server. Can't reach. |
 | **house730.com** | ❌ Cloudflare 403 | Hard Cloudflare block. Would need `playwright`. |
 | **spacious.hk** | ❌ Cloudflare | Cloudflare challenge page blocks all access. Client-rendered React app with undocumented GraphQL API at `/graphql`. |
