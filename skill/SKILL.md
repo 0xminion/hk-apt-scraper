@@ -6,7 +6,7 @@ description: Scrapes squarefoot.com.hk for HK apartment rentals matching specifi
 # HK Apartment Rental Scraper
 
 ## What it does
-Scrapes THREE sources for rental listings across 6+ HK Island districts:
+Scrapes FOUR sources for rental listings across HK Island:
 
 ### Source 1: Squarefoot.com.hk (cloudscraper)
 Districts: Wan Chai/Admiralty, Causeway Bay, Tin Hau, Central/Sheung Wan, Sai Ying Pun, Kennedy Town
@@ -35,7 +35,14 @@ URL pattern: `https://hk.centanet.com/findproperty/list/rent/{neighborhood}?adso
 - Building age directly in `buildingAge` field (no detail page needed!)
 - Net area in `areaInfo.nSize`, rent in `priceInfo.rent`
 
-Filters: 500-850 sqft, HKD$25k-55k/mo, building age <25yr, listing freshness <7 days, excludes Mid-Levels (checked against building name, address, district, description, and detail URL). Scores by floor height, direction, value-for-money, building newness, bedrooms, recency.
+### Source 4: House730.com (Camoufox + CF bypass)
+House730.com has hard Cloudflare 403 for all datacenter IPs. Uses Camoufox (stealth Firefox) to bypass CF, then intercepts the API response from `api.house730.com/Property/QueryProperty`. Requires GTK3 libs installed at `~/.local/lib/gtk3/`.
+
+Filters via API interception: `regionCode=HK01` (HK Island), `minSaleableArea=500`, `maxSaleableArea=850`, `minRentPrice=25000`, `maxRentPrice=55000`. Additional client-side filtering: excludes low floors (unitFloor=1 / 低層), buildings older than 25yr, mid-levels keyword match.
+
+Script: `~/.hermes/scripts/house730_scraper.py`
+
+Filters: 500-850 sqft, HKD$25k-55k/mo, building age <25yr, listing freshness <7 days, excludes Mid-Levels, excludes lower/ground floors (Low Floor, Ground Floor, Lower Floor). Scores by floor height, direction, value-for-money, building newness, bedrooms, recency.
 
 ## Deduplication pipeline
 Three-stage dedup before results are delivered:
@@ -49,6 +56,8 @@ Three-stage dedup before results are delivered:
 - Centanet scraper: `~/.hermes/scripts/centanet_scraper.js`
 - Midland scraper: `~/.hermes/scripts/midland_scraper.js`
 - Centanet results: `~/.hermes/scripts/centanet_results.json`
+- House730 scraper: `~/.hermes/scripts/house730_scraper.py`
+- House730 results: `~/.hermes/scripts/house730_results.json`
 - Seen IDs: `~/.hermes/scripts/hk_seen_ids.json`
 - State: `~/.hermes/scripts/hk_scraper_state.json`
 - Building ages: `~/.hermes/scripts/hk_building_ages.json`
@@ -87,6 +96,19 @@ Building age is NOT on listing cards — only on detail pages. Approach:
 - First run fetches ~200 detail pages (slow). Subsequent runs only check new buildings (fast).
 - Centanet has building age directly in listing data (no enrichment needed)
 
+## Floor filter (Apr 2026)
+Listings with "Low Floor", "Ground Floor", or "Lower Floor" are excluded. This applies to:
+- **Squarefoot**: parses floor from card text (e.g., "Low Floor 3")
+- **Midland**: parses floor from URL segments (e.g., "...-Lower-Flat-...")
+- **Centanet**: floor is null in listing data — not filtered (no floor info available)
+
+## Cloudflare bypass — tested Apr 2026
+Tested agent-browser, @browserless.io/browserless, @steel-dev/cli, bb-browser against house730.com and spacious.hk. None can bypass CF:
+- **house730.com**: Hard 403 block for all datacenter IPs (regardless of browser)
+- **spacious.hk**: JS challenge doesn't resolve for headless browsers
+- **Root cause**: IP reputation blocking, not browser fingerprinting. Would need residential proxy.
+- Existing sources (Squarefoot, Midland, Centanet) remain the working set.
+
 ## Other HK rental sites — tested reality
 | Site | Status | Notes |
 |---|---|---|
@@ -94,8 +116,8 @@ Building age is NOT on listing cards — only on detail pages. Approach:
 | **28hse.com** | ✅ Scrapable | Same parent company as squarefoot (28Hse Ltd). Same URL structure (`/en/rent/a1/dg4`), same lambda class fix needed. ~80-90% listing overlap with squarefoot — marginal value-add. |
 | **midland.com.hk** | ✅ Via API | `midland_scraper.js` uses Playwright to get Bearer token, then queries `data.midland.com.hk/search/v2/properties` directly. ~178 HK Island listings. Fast and reliable. |
 | **centaline.com.hk** | ❌ Timeout | Connection timeout from this server. Can't reach. |
-| **house730.com** | ❌ Cloudflare 403 | Hard Cloudflare block. Would need `playwright`. |
-| **spacious.hk** | ❌ Cloudflare | Cloudflare challenge page blocks all access. Client-rendered React app with undocumented GraphQL API at `/graphql`. |
+| **house730.com** | ✅ Via Camoufox | Hard CF 403 bypassed with Camoufox stealth Firefox. Intercepts API (`api.house730.com/Property/QueryProperty`). ~673 HK Island matches, ~11 pass all filters. Script: `house730_scraper.py`. GTK3 libs at `~/.local/lib/gtk3/`. |
+| **spacious.hk** | ⚠️ CF bypassed, limited value | Camoufox bypasses CF JS challenge. Site is fully client-rendered React. /rent page returns 404 (URL changed). Would need Camoufox + significant reverse engineering. Low priority. |
 
 ## Cron timezone note
 System timezone is CEST (UTC+2). To run at 11am GMT+8 (03:00 UTC), use cron `0 5 * * *` (05:00 CEST). Always verify with `date -u; date` before setting cron.
