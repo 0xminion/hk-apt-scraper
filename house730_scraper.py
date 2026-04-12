@@ -27,7 +27,7 @@ MAX_AREA = 850
 MIN_PRICE = 25000
 MAX_PRICE = 55000
 MAX_BUILDING_AGE = 25
-MAX_PAGES = 5  # 50 items per page = up to 250 listings
+MAX_PAGES = 50  # safety cap; actual limit is total_count / 50
 
 RESULTS_PATH = os.path.expanduser('~/.hermes/scripts/house730_results.json')
 
@@ -121,6 +121,33 @@ def normalize_listing(item):
     }
 
 
+def process_page(data, all_listings, seen_ids):
+    """Process one API response page, filtering and normalizing listings."""
+    items = data.get('result', {}).get('data', [])
+    page_kept = 0
+    for item in items:
+        region = item.get('regionCode', '')
+        if region != HK_ISLAND_REGION:
+            continue
+        listing = normalize_listing(item)
+        if listing is None:
+            continue
+        pid = listing.get('property_id')
+        if pid and pid not in seen_ids:
+            seen_ids.add(pid)
+            all_listings.append(listing)
+            page_kept += 1
+        elif not pid:
+            key = f"{listing['building']}-{listing['price']}-{listing['area_sqft']}"
+            if key not in seen_ids:
+                seen_ids.add(key)
+                all_listings.append(listing)
+                page_kept += 1
+    hk_total = sum(1 for i in items if i.get('regionCode') == HK_ISLAND_REGION)
+    print(f"  {len(items)} items ({hk_total} HK Island) → kept {page_kept} (running total: {len(all_listings)})")
+    return page_kept
+
+
 def scrape_house730():
     """Use Camoufox to load house730.com and intercept API responses."""
     all_listings = []
@@ -131,100 +158,92 @@ def scrape_house730():
     with Camoufox(headless=True) as browser:
         page = browser.new_page()
         
-        # Set up route handler BEFORE navigating
-        def handle_route(route):
+        # Track forced page index for route interceptor
+        forced_page = [1]
+        
+        def update_route(route):
             body = json.loads(route.request.post_data)
             body['minSaleableArea'] = MIN_AREA
             body['maxSaleableArea'] = MAX_AREA
             body['minRentPrice'] = MIN_PRICE
             body['maxRentPrice'] = MAX_PRICE
             body['pageCount'] = 50
-            # Try to filter for HK Island via region code
-            body['regionCode'] = 'HK01'
+            body['regionCode'] = HK_ISLAND_REGION
+            body['pageIndex'] = forced_page[0]
             route.continue_(post_data=json.dumps(body))
         
-        page.route('**/Property/QueryProperty', handle_route)
+        page.route('**/Property/QueryProperty', update_route)
         
-        page_num = 0
         total_count = None
+        consecutive_empty = 0
         
-        while page_num < MAX_PAGES:
-            page_num += 1
-            api_responses = []
+        # Load initial page
+        api_responses = []
+        def capture_response(response):
+            if 'QueryProperty' in response.url:
+                try:
+                    api_responses.append(response.json())
+                except:
+                    pass
+        
+        page.on('response', capture_response)
+        page.goto('https://www.house730.com/rent/t1/', timeout=30000)
+        page.wait_for_timeout(8000)
+        
+        # Process first page
+        if api_responses:
+            data = api_responses[0]
+            total_count = data.get('result', {}).get('count', 0)
+            print(f"  Total matching: {total_count}")
+            process_page(data, all_listings, seen_ids)
+        
+        # Keep clicking ">" to advance pages — the interceptor forces the correct pageIndex
+        max_api_pages = (total_count // 50) + 1 if total_count else MAX_PAGES
+        
+        for page_idx in range(2, min(max_api_pages + 1, 50)):
+            forced_page[0] = page_idx
+            api_responses.clear()
             
-            def capture_response(response):
-                if 'QueryProperty' in response.url:
-                    try:
-                        api_responses.append(response.json())
-                    except:
-                        pass
+            # Find and click the ">" (next) button — always the last .page-step
+            steps = page.locator('.page-step')
+            step_count = steps.count()
             
-            page.on('response', capture_response)
+            clicked = False
+            if step_count > 0:
+                last_step = steps.nth(step_count - 1)
+                last_text = last_step.inner_text().strip()
+                if last_text == '>' or last_text == '›':
+                    last_step.click()
+                    clicked = True
+                elif last_text.isdigit():
+                    # Could be a page number or the ">" rendered differently
+                    last_step.click()
+                    clicked = True
             
-            if page_num == 1:
-                page.goto('https://www.house730.com/rent/t1/', timeout=30000)
-            else:
-                # Click page number via Playwright locator (Vue renders .page-step <p> elements)
-                # nth(page_num - 1) because .page-step[0] = page 1, [1] = page 2, etc.
-                page_btn = page.locator('.page-step').nth(page_num - 1)
-                if page_btn.count() > 0:
-                    page_btn.click()
-                else:
-                    print(f"  Page {page_num}: no .page-step button found, stopping")
-                    break
+            if not clicked:
+                print(f"  Page {page_idx}: no navigation button, stopping")
+                break
             
-            page.wait_for_timeout(8000)
+            page.wait_for_timeout(6000)
             
             if not api_responses:
-                print(f"  Page {page_num}: No API response")
-                break
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    print(f"  Page {page_idx}: 2 consecutive empty responses, stopping")
+                    break
+                continue
             
-            data = api_responses[0]
-            result = data.get('result', {})
-            items = result.get('data', [])
-            
-            if total_count is None:
-                total_count = result.get('count', 0)
-                print(f"  Total matching: {total_count}")
-            
+            consecutive_empty = 0
+            items = api_responses[0].get('result', {}).get('data', [])
             if not items:
-                print(f"  Page {page_num}: No items")
+                print(f"  Page {page_idx}: 0 items, stopping")
                 break
             
-            # Filter for HK Island and normalize
-            page_listings = []
-            for item in items:
-                region = item.get('regionCode', '')
-                if region != HK_ISLAND_REGION:
-                    continue
-                
-                listing = normalize_listing(item)
-                if listing is None:
-                    continue  # Mid-Levels excluded
-                
-                pid = listing.get('property_id')
-                if pid and pid not in seen_ids:
-                    seen_ids.add(pid)
-                    page_listings.append(listing)
-                elif not pid:
-                    key = f"{listing['building']}-{listing['price']}-{listing['area_sqft']}"
-                    if key not in seen_ids:
-                        seen_ids.add(key)
-                        page_listings.append(listing)
-            
-            all_listings.extend(page_listings)
-            hk_total = sum(1 for i in items if i.get('regionCode') == HK_ISLAND_REGION)
-            print(f"  Page {page_num}: {len(items)} items ({hk_total} HK Island) → kept {len(page_listings)} (running total: {len(all_listings)})")
-            
-            # Remove listener for next iteration
-            page.remove_listener('response', capture_response)
-            
-            if len(items) < 50:
-                break  # Last page
-            
-            time.sleep(1)
+            process_page(api_responses[0], all_listings, seen_ids)
+            time.sleep(0.5)
         
-        page.unroute('**/Property/QueryProperty', handle_route)
+        page.remove_listener('response', capture_response)
+        page.unroute('**/Property/QueryProperty', update_route)
     
     print(f"\nTotal House730: {len(all_listings)} HK Island listings")
     
