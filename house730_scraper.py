@@ -164,13 +164,14 @@ def scrape_house730():
             if page_num == 1:
                 page.goto('https://www.house730.com/rent/t1/', timeout=30000)
             else:
-                # Click next page button
-                next_btn = page.query_selector('.next, [class*="next"], a:has-text("下一頁"), a:has-text("下一页")')
-                if next_btn:
-                    next_btn.click()
+                # Click page number via Playwright locator (Vue renders .page-step <p> elements)
+                # nth(page_num - 1) because .page-step[0] = page 1, [1] = page 2, etc.
+                page_btn = page.locator('.page-step').nth(page_num - 1)
+                if page_btn.count() > 0:
+                    page_btn.click()
                 else:
-                    # Fallback: scroll to trigger lazy loading
-                    page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    print(f"  Page {page_num}: no .page-step button found, stopping")
+                    break
             
             page.wait_for_timeout(8000)
             
