@@ -278,6 +278,11 @@ def filter_listings(listings):
         if age is not None and age > MAX_BUILDING_AGE:
             continue
 
+        # Exclude lower floors (Low Floor, Ground Floor, Lower Floor)
+        floor_text = (l.get('floor') or '').lower()
+        if floor_text and any(f in floor_text for f in ['low floor', 'ground floor', 'lower floor']):
+            continue
+
         # Exclude Mid-Levels locations (check all text fields + URL)
         searchable = ' '.join([
             (l.get('building') or '').lower(),
@@ -384,7 +389,7 @@ def format_report(new_listings, all_filtered, stats):
     lines = []
     lines.append(f"🏠 HK Apartment Daily Report — {now}")
     lines.append(f"Scraped {stats['total_scraped']} listings from {stats['districts']} districts")
-    lines.append(f"Budget: HKD$25k-55k/mo | Size: 500-850 sqft | Age: <25yr | Fresh: <7 days")
+    lines.append(f"Budget: HKD$25k-55k/mo | Size: 500-850 sqft | Age: <25yr | Fresh: <7 days | Floor: exclude lower/ground")
     lines.append(f"Filtered: {stats['filtered']} match all criteria ({stats['new']} new today)")
     lines.append("")
 
@@ -404,7 +409,7 @@ def format_report(new_listings, all_filtered, stats):
         direction = f" {l['direction']}" if l.get('direction') else ''
         age_str = f" | 🏗{l['building_age']}yr" if l.get('building_age') else ''
         source = l.get('source', 'squarefoot')
-        src_tag = {'midland': '🟠', 'centanet': '🟢'}.get(source, '🔵')
+        src_tag = {'midland': '🟠', 'centanet': '🟢', 'house730': '🔴'}.get(source, '🔵')
         cat = '📌'
         score = l.get('score', 0)
         building = l.get('building') or 'Unknown'
@@ -428,6 +433,40 @@ def format_report(new_listings, all_filtered, stats):
         lines.append(f"  {name}: https://www.squarefoot.com.hk{path}")
 
     return '\n'.join(lines)
+
+
+def scrape_house730():
+    """Run the Camoufox-based House730 scraper and return listings."""
+    import subprocess
+    script_path = os.path.expanduser('~/.hermes/scripts/house730_scraper.py')
+    results_path = os.path.expanduser('~/.hermes/scripts/house730_results.json')
+    gtk_lib = os.path.expanduser('~/.local/lib/gtk3/usr/lib/x86_64-linux-gnu')
+
+    try:
+        result = subprocess.run(
+            ['python3', script_path],
+            capture_output=True, text=True, timeout=300,
+            env={**os.environ, 'LD_LIBRARY_PATH': gtk_lib}
+        )
+        if result.stdout:
+            for line in result.stdout.strip().split('\n'):
+                if 'Total' in line or 'kept' in line.lower():
+                    print(f"  {line}")
+        if result.returncode != 0:
+            print(f"  House730 error (rc={result.returncode}): {result.stderr[:300]}")
+            return []
+    except subprocess.TimeoutExpired:
+        print("  House730 scraper timed out")
+        return []
+    except Exception as e:
+        print(f"  House730 scraper error: {e}")
+        return []
+
+    if os.path.exists(results_path):
+        with open(results_path) as f:
+            listings = json.load(f)
+        return listings
+    return []
 
 
 def scrape_centanet():
@@ -523,6 +562,16 @@ def main():
 
     # Count by district including Midland
     for l in midland_listings:
+        d = l.get('district', 'Unknown')
+        district_counts[d] = district_counts.get(d, 0) + 1
+
+    # --- Scrape House730 (Camoufox) ---
+    print("\n=== House730.com (Camoufox) ===")
+    house730_listings = scrape_house730()
+    print(f"  Total House730: {len(house730_listings)} listings")
+    all_listings.extend(house730_listings)
+
+    for l in house730_listings:
         d = l.get('district', 'Unknown')
         district_counts[d] = district_counts.get(d, 0) + 1
 
