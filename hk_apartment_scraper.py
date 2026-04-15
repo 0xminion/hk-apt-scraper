@@ -17,6 +17,7 @@ import os
 import hashlib
 import time
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TARGET_DISTRICTS = {
@@ -404,25 +405,44 @@ def format_report(new_listings, all_filtered, stats):
     for i, l in enumerate(show_list, 1):
         price_str = f"HKD${l['price']:,}" if l.get('price') else '?'
         area_str = f"{l['area_sqft']} sqft" if l.get('area_sqft') else '?'
-        beds = f"{l['bedrooms']}BR" if l.get('bedrooms') else '?'
+        beds = f"{l['bedrooms']}BR" if l.get('bedrooms') else None
         floor = l.get('floor') or ''
-        direction = f" {l['direction']}" if l.get('direction') else ''
-        age_str = f" | 🏗{l['building_age']}yr" if l.get('building_age') else ''
+        direction = l.get('direction') or ''
+        age_str = f"🏗{l['building_age']}yr" if l.get('building_age') else None
         source = l.get('source', 'squarefoot')
         src_tag = {'midland': '🟠', 'centanet': '🟢', 'house730': '🔴'}.get(source, '🔵')
-        cat = '📌'
         score = l.get('score', 0)
         building = l.get('building') or 'Unknown'
 
-        lines.append(f"{cat} {i}. [{score}pts] {src_tag} {building}")
-        lines.append(f"   📍 {l.get('district', '?')}")
+        lines.append(f"{i}. [{score}pts] {src_tag} {building}")
+        lines.append(f"📍 {l.get('district', '?')}")
         if l.get('address'):
-            lines.append(f"   🏠 {l['address']}")
-        lines.append(f"   💰 {price_str} | 📐 {area_str} | 🛏 {beds} | {floor}{direction}{age_str}")
+            lines.append(f"🏠 {l['address']}")
+
+        # Line 3: 💰 price | 📐 area | floor | direction
+        third_line_parts = [price_str, area_str]
+        if floor:
+            third_line_parts.append(floor)
+        if direction:
+            third_line_parts.append(direction)
+        lines.append(f"💰 {third_line_parts[0]} | 📐 {third_line_parts[1]}" +
+                     (f" | {third_line_parts[2]}" if len(third_line_parts) > 2 else "") +
+                     (f" | {third_line_parts[3]}" if len(third_line_parts) > 3 else ""))
+
+        # Line 4: 🛏 beds | 🏗 age
+        bed_age_parts = []
+        if beds:
+            bed_age_parts.append(beds)
+        if age_str:
+            bed_age_parts.append(age_str)
+        if bed_age_parts:
+            prefix = "🛏 " if beds else ""
+            lines.append(f"{prefix}{' | '.join(bed_age_parts)}")
+
         if l.get('description'):
-            lines.append(f"   📝 {l['description'][:100]}")
+            lines.append(f"📝 {l['description'][:100]}")
         if l.get('url'):
-            lines.append(f"   🔗 {l['url']}")
+            lines.append(f"🔗 [Link]({l['url']})")
         lines.append("")
 
     lines.append("— Summary —")
@@ -536,63 +556,127 @@ def scrape_midland():
     return []
 
 
-def main():
+def scrape_squarefoot_camoufox():
+    """Run the Camoufox-based Squarefoot scraper and return listings."""
+    import subprocess
+    script_path = os.path.expanduser('~/.hermes/scripts/squarefoot_scraper.py')
+    results_path = os.path.expanduser('~/.hermes/scripts/squarefoot_results.json')
+    gtk_lib = os.path.expanduser('~/.local/lib/gtk3/usr/lib/x86_64-linux-gnu')
+
+    try:
+        result = subprocess.run(
+            ['python3', script_path],
+            capture_output=True, text=True, timeout=300,
+            env={**os.environ, 'LD_LIBRARY_PATH': gtk_lib}
+        )
+        if result.stdout:
+            for line in result.stdout.strip().split('\n'):
+                if 'Total' in line or 'Got' in line:
+                    print(f"  {line}")
+        if result.returncode != 0:
+            print(f"  Squarefoot Camoufox error (rc={result.returncode}): {result.stderr[:300]}")
+            return []
+    except subprocess.TimeoutExpired:
+        print("  Squarefoot Camoufox timed out")
+        return []
+    except Exception as e:
+        print(f"  Squarefoot Camoufox error: {e}")
+        return []
+
+    if os.path.exists(results_path):
+        with open(results_path) as f:
+            listings = json.load(f)
+        return listings
+    return []
+
+
+def scrape_square():
+    """Run the Squarefoot scraper — tries Camoufox first, falls back to cloudscraper."""
+    listings = scrape_squarefoot_camoufox()
+    if listings:
+        return listings
+
+    print("  Camoufox failed, falling back to cloudscraper...")
     scraper = cloudscraper.create_scraper()
+    all_listings = []
+    for district_name, path in TARGET_DISTRICTS.items():
+        district_listings = scrape_district(scraper, district_name, path)
+        all_listings.extend(district_listings)
+        print(f"  {district_name}: {len(district_listings)} listings")
+        time.sleep(1)
+    return all_listings
+
+
+def run_scraper_parallel(name, func):
+    """Wrapper to run a scraper function with a name label."""
+    print(f"\n--- Starting {name} ---")
+    start = time.time()
+    try:
+        result = func()
+        elapsed = time.time() - start
+        print(f"--- {name} done: {len(result)} listings ({elapsed:.0f}s) ---")
+        return name, result
+    except Exception as e:
+        elapsed = time.time() - start
+        print(f"--- {name} failed: {e} ({elapsed:.0f}s) ---")
+        return name, []
+
+
+def main():
     seen = load_json(SEEN_FILE)
     age_cache = load_json(BUILDING_AGE_CACHE)
 
     all_listings = []
     district_counts = {}
 
-    # --- Scrape Squarefoot ---
-    print("=== Squarefoot.com.hk ===")
-    for district_name, path in TARGET_DISTRICTS.items():
-        print(f"Scraping: {district_name}")
-        listings = scrape_district(scraper, district_name, path)
-        district_counts[district_name] = len(listings)
+    # --- Run all scrapers in parallel ---
+    print("=== Running all scrapers in parallel ===")
+    scrapers = {
+        'Squarefoot': lambda: scrape_square(),
+        'Midland': scrape_midland,
+        'House730': scrape_house730,
+        'Centanet': scrape_centanet,
+    }
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(run_scraper_parallel, name, func): name
+            for name, func in scrapers.items()
+        }
+        for future in as_completed(futures):
+            name, listings = future.result()
+            results[name] = listings
+
+    # --- Collect results in order ---
+    source_map = {
+        'Squarefoot': ('squarefoot', '🔵'),
+        'Midland': ('midland', '🟠'),
+        'House730': ('house730', '🔴'),
+        'Centanet': ('centanet', '🟢'),
+    }
+
+    for name, listings in results.items():
+        source_tag, emoji = source_map.get(name, ('unknown', '⚪'))
+        print(f"\n{name} ({emoji}): {len(listings)} listings")
         all_listings.extend(listings)
-        print(f"  Got {len(listings)} listings")
-        time.sleep(1)
 
-    # --- Scrape Midland ---
-    print("\n=== Midland.com.hk ===")
-    midland_listings = scrape_midland()
-    print(f"  Total Midland: {len(midland_listings)} listings")
-    all_listings.extend(midland_listings)
+        for l in listings:
+            d = l.get('district', 'Unknown')
+            district_counts[d] = district_counts.get(d, 0) + 1
 
-    # Count by district including Midland
-    for l in midland_listings:
-        d = l.get('district', 'Unknown')
-        district_counts[d] = district_counts.get(d, 0) + 1
-
-    # --- Scrape House730 (Camoufox) ---
-    print("\n=== House730.com (Camoufox) ===")
-    house730_listings = scrape_house730()
-    print(f"  Total House730: {len(house730_listings)} listings")
-    all_listings.extend(house730_listings)
-
-    for l in house730_listings:
-        d = l.get('district', 'Unknown')
-        district_counts[d] = district_counts.get(d, 0) + 1
-
-    # --- Scrape Centanet ---
-    print("\n=== Centanet.com (中原地產) ===")
-    centanet_listings = scrape_centanet()
-    print(f"  Total Centanet: {len(centanet_listings)} listings")
-    all_listings.extend(centanet_listings)
-
-    for l in centanet_listings:
-        d = l.get('district', 'Unknown')
-        district_counts[d] = district_counts.get(d, 0) + 1
-
-    print(f"\nTotal scraped: {len(all_listings)}. Enriching building ages...")
-    all_listings = enrich_building_ages(scraper, all_listings, age_cache)
+    # --- Enrich building ages (only for Squarefoot/Midland — others have age in data) ---
+    sf_ml_listings = [l for l in all_listings if l.get('source') in ('squarefoot', 'midland')]
+    other_listings = [l for l in all_listings if l.get('source') not in ('squarefoot', 'midland')]
+    print(f"\nEnriching building ages for {len(sf_ml_listings)} Squarefoot/Midland listings...")
+    sf_ml_listings = enrich_building_ages(cloudscraper.create_scraper(), sf_ml_listings, age_cache)
+    all_listings = sf_ml_listings + other_listings
 
     # Filter
     filtered = filter_listings(all_listings)
 
     # Cross-source deduplication within this run
-    source_priority = {'squarefoot': 0, 'midland': 1, 'centanet': 2}
+    source_priority = {'squarefoot': 0, 'midland': 1, 'centanet': 2, 'house730': 3}
     deduped = {}
     dupes_removed = 0
     for l in filtered:
