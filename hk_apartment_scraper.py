@@ -16,8 +16,18 @@ import json
 import os
 import hashlib
 import time
+import sys
+import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# --- Logging to stderr only (stdout reserved for final report) ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    stream=sys.stderr,
+)
+log = logging.getLogger('hk_scraper')
 
 # --- Configuration ---
 TARGET_DISTRICTS = {
@@ -212,7 +222,7 @@ def scrape_district(scraper, district_name, path):
                     break  # Got data, stop retrying
                 time.sleep(1.5)  # Brief wait before retry
             except Exception as e:
-                print(f"  Error on page {page} attempt {attempt+1}: {e}")
+                log.warning("  Error on page %s attempt %s: %s", page, attempt+1, e)
                 time.sleep(1)
         if not items:
             continue
@@ -252,7 +262,7 @@ def enrich_building_ages(scraper, listings, age_cache):
 
     if fetched > 0:
         save_json(BUILDING_AGE_CACHE, age_cache)
-        print(f"  Fetched {fetched} new building ages")
+        log.info("  Fetched %s new building ages", fetched)
 
     # Third pass: assign newly fetched ages
     for l in listings:
@@ -445,12 +455,9 @@ def format_report(new_listings, all_filtered, stats):
             lines.append(f"🔗 [Link]({l['url']})")
         lines.append("")
 
-    lines.append("— Summary —")
-    lines.append(f"Total matching: {len(all_filtered)} (500-850 sqft)")
-    lines.append("")
-    lines.append("🔍 Browse manually:")
+    log.info("Total matching: %s (500-850 sqft)", len(all_filtered))
     for name, path in TARGET_DISTRICTS.items():
-        lines.append(f"  {name}: https://www.squarefoot.com.hk{path}")
+        log.info("Browse manually - %s: https://www.squarefoot.com.hk%s", name, path)
 
     return '\n'.join(lines)
 
@@ -471,15 +478,15 @@ def scrape_house730():
         if result.stdout:
             for line in result.stdout.strip().split('\n'):
                 if 'Total' in line or 'kept' in line.lower():
-                    print(f"  {line}")
+                    log.info("  %s", line)
         if result.returncode != 0:
-            print(f"  House730 error (rc={result.returncode}): {result.stderr[:300]}")
+            log.error("  House730 error (rc=%s): %s", result.returncode, result.stderr[:300])
             return []
     except subprocess.TimeoutExpired:
-        print("  House730 scraper timed out")
+        log.error("  House730 scraper timed out")
         return []
     except Exception as e:
-        print(f"  House730 scraper error: {e}")
+        log.error("  House730 scraper error: %s", e)
         return []
 
     if os.path.exists(results_path):
@@ -504,15 +511,15 @@ def scrape_centanet():
         if result.stdout:
             for line in result.stdout.strip().split('\n'):
                 if 'Total' in line or 'Scraping' in line:
-                    print(f"  {line}")
+                    log.info("  %s", line)
         if result.returncode != 0:
-            print(f"  Centanet error (rc={result.returncode}): {result.stderr[:300]}")
+            log.error("  Centanet error (rc=%s): %s", result.returncode, result.stderr[:300])
             return []
     except subprocess.TimeoutExpired:
-        print("  Centanet scraper timed out")
+        log.error("  Centanet scraper timed out")
         return []
     except Exception as e:
-        print(f"  Centanet scraper error: {e}")
+        log.error("  Centanet scraper error: %s", e)
         return []
 
     if os.path.exists(results_path):
@@ -538,15 +545,15 @@ def scrape_midland():
         if result.stdout:
             for line in result.stdout.strip().split('\n'):
                 if 'Total Midland' in line or 'Got' in line:
-                    print(f"  {line}")
+                    log.info("  %s", line)
         if result.returncode != 0:
-            print(f"  Midland error (rc={result.returncode}): {result.stderr[:300]}")
+            log.error("  Midland error (rc=%s): %s", result.returncode, result.stderr[:300])
             return []
     except subprocess.TimeoutExpired:
-        print("  Midland scraper timed out")
+        log.error("  Midland scraper timed out")
         return []
     except Exception as e:
-        print(f"  Midland scraper error: {e}")
+        log.error("  Midland scraper error: %s", e)
         return []
 
     if os.path.exists(results_path):
@@ -572,15 +579,15 @@ def scrape_squarefoot_camoufox():
         if result.stdout:
             for line in result.stdout.strip().split('\n'):
                 if 'Total' in line or 'Got' in line:
-                    print(f"  {line}")
+                    log.info("  %s", line)
         if result.returncode != 0:
-            print(f"  Squarefoot Camoufox error (rc={result.returncode}): {result.stderr[:300]}")
+            log.error("  Squarefoot Camoufox error (rc=%s): %s", result.returncode, result.stderr[:300])
             return []
     except subprocess.TimeoutExpired:
-        print("  Squarefoot Camoufox timed out")
+        log.error("  Squarefoot Camoufox timed out")
         return []
     except Exception as e:
-        print(f"  Squarefoot Camoufox error: {e}")
+        log.error("  Squarefoot Camoufox error: %s", e)
         return []
 
     if os.path.exists(results_path):
@@ -596,29 +603,29 @@ def scrape_square():
     if listings:
         return listings
 
-    print("  Camoufox failed, falling back to cloudscraper...")
+    log.info("  Camoufox failed, falling back to cloudscraper...")
     scraper = cloudscraper.create_scraper()
     all_listings = []
     for district_name, path in TARGET_DISTRICTS.items():
         district_listings = scrape_district(scraper, district_name, path)
         all_listings.extend(district_listings)
-        print(f"  {district_name}: {len(district_listings)} listings")
+        log.info("  %s: %s listings", district_name, len(district_listings))
         time.sleep(1)
     return all_listings
 
 
 def run_scraper_parallel(name, func):
     """Wrapper to run a scraper function with a name label."""
-    print(f"\n--- Starting {name} ---")
+    log.info("--- Starting %s ---", name)
     start = time.time()
     try:
         result = func()
         elapsed = time.time() - start
-        print(f"--- {name} done: {len(result)} listings ({elapsed:.0f}s) ---")
+        log.info("--- %s done: %s listings (%.0fs) ---", name, len(result), elapsed)
         return name, result
     except Exception as e:
         elapsed = time.time() - start
-        print(f"--- {name} failed: {e} ({elapsed:.0f}s) ---")
+        log.error("--- %s failed: %s (%.0fs) ---", name, e, elapsed)
         return name, []
 
 
@@ -630,7 +637,7 @@ def main():
     district_counts = {}
 
     # --- Run all scrapers in parallel ---
-    print("=== Running all scrapers in parallel ===")
+    log.info("=== Running all scrapers in parallel ===")
     scrapers = {
         'Squarefoot': lambda: scrape_square(),
         'Midland': scrape_midland,
@@ -658,7 +665,7 @@ def main():
 
     for name, listings in results.items():
         source_tag, emoji = source_map.get(name, ('unknown', '⚪'))
-        print(f"\n{name} ({emoji}): {len(listings)} listings")
+        log.info("%s (%s): %s listings", name, emoji, len(listings))
         all_listings.extend(listings)
 
         for l in listings:
@@ -668,7 +675,7 @@ def main():
     # --- Enrich building ages (only for Squarefoot/Midland — others have age in data) ---
     sf_ml_listings = [l for l in all_listings if l.get('source') in ('squarefoot', 'midland')]
     other_listings = [l for l in all_listings if l.get('source') not in ('squarefoot', 'midland')]
-    print(f"\nEnriching building ages for {len(sf_ml_listings)} Squarefoot/Midland listings...")
+    log.info("Enriching building ages for %s Squarefoot/Midland listings...", len(sf_ml_listings))
     sf_ml_listings = enrich_building_ages(cloudscraper.create_scraper(), sf_ml_listings, age_cache)
     all_listings = sf_ml_listings + other_listings
 
@@ -694,7 +701,7 @@ def main():
         else:
             deduped[lid] = l
     filtered = sorted(deduped.values(), key=lambda x: x.get('score', 0), reverse=True)
-    print(f"Dedup: {dupes_removed} cross-source duplicates removed ({len(filtered)} unique)")
+    log.info("Dedup: %s cross-source duplicates removed (%s unique)", dupes_removed, len(filtered))
 
     # Deduplicate against seen
     new_listings = []
