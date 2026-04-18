@@ -21,11 +21,12 @@ import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- Logging to stderr only (stdout reserved for final report) ---
+# --- Logging: file only (stdout reserved for final report, stderr merged by cron) ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    stream=sys.stderr,
+    filename=os.path.expanduser('~/.hermes/scripts/hk_scraper.log'),
+    filemode='a',
 )
 log = logging.getLogger('hk_scraper')
 
